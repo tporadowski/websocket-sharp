@@ -100,7 +100,7 @@ namespace WebSocketSharp.Net
 
     public bool WantMore {
       get {
-        return _chunkRead != _chunkSize || _chunkSize != 0 || _state != InputChunkState.None;
+        return _state != InputChunkState.End;
       }
     }
 
@@ -108,10 +108,11 @@ namespace WebSocketSharp.Net
 
     #region Private Methods
 
-    private int readFromChunks (byte[] buffer, int offset, int count)
+    private int read (byte[] buffer, int offset, int count)
     {
-      var cnt = _chunks.Count;
       var nread = 0;
+
+      var cnt = _chunks.Count;
       for (var i = 0; i < cnt; i++) {
         var chunk = _chunks[i];
         if (chunk == null)
@@ -144,7 +145,7 @@ namespace WebSocketSharp.Net
 
         _sawCr = true;
         if (offset == length)
-          return InputChunkState.BodyFinished;
+          return InputChunkState.DataEnded;
       }
 
       if (buffer[offset++] != 10)
@@ -177,7 +178,7 @@ namespace WebSocketSharp.Net
           _gotIt = true;
 
         if (!_gotIt)
-          _saved.Append (b);
+          _saved.Append ((char) b);
 
         if (_saved.Length > 20)
           throwProtocolViolation ("The chunk size is too long.");
@@ -200,17 +201,17 @@ namespace WebSocketSharp.Net
         return InputChunkState.Trailer;
       }
 
-      return InputChunkState.Body;
+      return InputChunkState.Data;
     }
 
-    private InputChunkState setHeaders (byte[] buffer, ref int offset, int length)
+    private InputChunkState setTrailer (byte[] buffer, ref int offset, int length)
     {
-      // 0\r\n\r\n
+      // Check if no trailer.
       if (_trailerState == 2 && buffer[offset] == 13 && _saved.Length == 0) {
         offset++;
         if (offset < length && buffer[offset] == 10) {
           offset++;
-          return InputChunkState.None;
+          return InputChunkState.End;
         }
 
         offset--;
@@ -218,7 +219,7 @@ namespace WebSocketSharp.Net
 
       while (offset < length && _trailerState < 4) {
         var b = buffer[offset++];
-        _saved.Append (b);
+        _saved.Append ((char) b);
         if (_saved.Length > 4196)
           throwProtocolViolation ("The trailer is too long.");
 
@@ -251,7 +252,7 @@ namespace WebSocketSharp.Net
       while ((line = reader.ReadLine ()) != null && line.Length > 0)
         _headers.Add (line);
 
-      return InputChunkState.None;
+      return InputChunkState.End;
     }
 
     private static void throwProtocolViolation (string message)
@@ -261,6 +262,9 @@ namespace WebSocketSharp.Net
 
     private void write (byte[] buffer, ref int offset, int length)
     {
+      if (_state == InputChunkState.End)
+        throwProtocolViolation ("The chunks were ended.");
+
       if (_state == InputChunkState.None) {
         _state = setChunkSize (buffer, ref offset, length);
         if (_state == InputChunkState.None)
@@ -271,22 +275,22 @@ namespace WebSocketSharp.Net
         _gotIt = false;
       }
 
-      if (_state == InputChunkState.Body && offset < length) {
-        _state = writeBody (buffer, ref offset, length);
-        if (_state == InputChunkState.Body)
+      if (_state == InputChunkState.Data && offset < length) {
+        _state = writeData (buffer, ref offset, length);
+        if (_state == InputChunkState.Data)
           return;
       }
 
-      if (_state == InputChunkState.BodyFinished && offset < length) {
+      if (_state == InputChunkState.DataEnded && offset < length) {
         _state = seekCrLf (buffer, ref offset, length);
-        if (_state == InputChunkState.BodyFinished)
+        if (_state == InputChunkState.DataEnded)
           return;
 
         _sawCr = false;
       }
 
       if (_state == InputChunkState.Trailer && offset < length) {
-        _state = setHeaders (buffer, ref offset, length);
+        _state = setTrailer (buffer, ref offset, length);
         if (_state == InputChunkState.Trailer)
           return;
 
@@ -297,24 +301,38 @@ namespace WebSocketSharp.Net
         write (buffer, ref offset, length);
     }
 
-    private InputChunkState writeBody (byte[] buffer, ref int offset, int length)
+    private InputChunkState writeData (byte[] buffer, ref int offset, int length)
     {
-      if (_chunkSize == 0)
-        return InputChunkState.BodyFinished;
-
       var cnt = length - offset;
       var left = _chunkSize - _chunkRead;
       if (cnt > left)
         cnt = left;
 
-      var body = new byte[cnt];
-      Buffer.BlockCopy (buffer, offset, body, 0, cnt);
-      _chunks.Add (new Chunk (body));
+      var data = new byte[cnt];
+      Buffer.BlockCopy (buffer, offset, data, 0, cnt);
+      _chunks.Add (new Chunk (data));
 
       offset += cnt;
       _chunkRead += cnt;
 
-      return _chunkRead == _chunkSize ? InputChunkState.BodyFinished : InputChunkState.Body;
+      return _chunkRead == _chunkSize ? InputChunkState.DataEnded : InputChunkState.Data;
+    }
+
+    #endregion
+
+    #region Internal Methods
+
+    internal void ResetBuffer ()
+    {
+      _chunkRead = 0;
+      _chunkSize = -1;
+      _chunks.Clear ();
+    }
+
+    internal int WriteAndReadBack (byte[] buffer, int offset, int writeCount, int readCount)
+    {
+      Write (buffer, offset, writeCount);
+      return Read (buffer, offset, readCount);
     }
 
     #endregion
@@ -323,14 +341,10 @@ namespace WebSocketSharp.Net
 
     public int Read (byte[] buffer, int offset, int count)
     {
-      return readFromChunks (buffer, offset, count);
-    }
+      if (count <= 0)
+        return 0;
 
-    public void ResetBuffer ()
-    {
-      _chunkSize = -1;
-      _chunkRead = 0;
-      _chunks.Clear ();
+      return read (buffer, offset, count);
     }
 
     public void Write (byte[] buffer, int offset, int count)
@@ -339,12 +353,6 @@ namespace WebSocketSharp.Net
         return;
 
       write (buffer, ref offset, offset + count);
-    }
-
-    public void WriteAndReadBack (byte[] buffer, int offset, int count, ref int read)
-    {
-      Write (buffer, offset, read);
-      read = readFromChunks (buffer, offset, count);
     }
 
     #endregion

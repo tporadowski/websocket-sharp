@@ -14,7 +14,7 @@
  * Copyright (c) 2003 Ben Maurer
  * Copyright (c) 2003, 2005, 2009 Novell, Inc. (http://www.novell.com)
  * Copyright (c) 2009 Stephane Delcroix
- * Copyright (c) 2010-2015 sta.blockhead
+ * Copyright (c) 2010-2016 sta.blockhead
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -40,6 +40,8 @@
 /*
  * Contributors:
  * - Liryna <liryna.stark@gmail.com>
+ * - Nikola Kovacevic <nikolak@outlook.com>
+ * - Chris Swiedler
  */
 #endregion
 
@@ -65,6 +67,7 @@ namespace WebSocketSharp
     #region Private Fields
 
     private static readonly byte[] _last = new byte[] { 0x00 };
+    private static readonly int    _retry = 5;
     private const string           _tspecials = "()<>@,;:\\\"/[]?={} \t";
 
     #endregion
@@ -74,7 +77,7 @@ namespace WebSocketSharp
     private static byte[] compress (this byte[] data)
     {
       if (data.LongLength == 0)
-        //return new Byte[] { 0x00, 0x00, 0x00, 0xff, 0xff };
+        //return new byte[] { 0x00, 0x00, 0x00, 0xff, 0xff };
         return data;
 
       using (var input = new MemoryStream (data))
@@ -89,8 +92,8 @@ namespace WebSocketSharp
 
       stream.Position = 0;
       using (var ds = new DeflateStream (output, CompressionMode.Compress, true)) {
-        stream.CopyTo (ds);
-        ds.Close (); // "BFINAL" set to 1.
+        stream.CopyTo (ds, 1024);
+        ds.Close (); // BFINAL set to 1.
         output.Write (_last, 0, 1);
         output.Position = 0;
 
@@ -123,7 +126,7 @@ namespace WebSocketSharp
 
       stream.Position = 0;
       using (var ds = new DeflateStream (stream, CompressionMode.Decompress, true)) {
-        ds.CopyTo (output);
+        ds.CopyTo (output, 1024);
         output.Position = 0;
 
         return output;
@@ -138,44 +141,23 @@ namespace WebSocketSharp
       }
     }
 
-    private static byte[] readBytes (this Stream stream, byte[] buffer, int offset, int length)
+    private static bool isHttpMethod (this string value)
     {
-      var len = 0;
-      try {
-        len = stream.Read (buffer, offset, length);
-        if (len < 1)
-          return buffer.SubArray (0, offset);
-
-        while (len < length) {
-          var readLen = stream.Read (buffer, offset + len, length - len);
-          if (readLen < 1)
-            break;
-
-          len += readLen;
-        }
-      }
-      catch {
-      }
-
-      return len < length
-             ? buffer.SubArray (0, offset + len)
-             : buffer;
+      return value == "GET"
+             || value == "HEAD"
+             || value == "POST"
+             || value == "PUT"
+             || value == "DELETE"
+             || value == "CONNECT"
+             || value == "OPTIONS"
+             || value == "TRACE";
     }
 
-    private static bool readBytes (
-      this Stream stream, byte[] buffer, int offset, int length, Stream destination)
+    private static bool isHttpMethod10 (this string value)
     {
-      var bytes = stream.readBytes (buffer, offset, length);
-      var len = bytes.Length;
-      destination.Write (bytes, 0, len);
-
-      return len == offset + length;
-    }
-
-    private static void times (this ulong n, Action action)
-    {
-      for (ulong i = 0; i < n; i++)
-        action ();
+      return value == "GET"
+             || value == "HEAD"
+             || value == "POST";
     }
 
     #endregion
@@ -184,139 +166,28 @@ namespace WebSocketSharp
 
     internal static byte[] Append (this ushort code, string reason)
     {
-      using (var buff = new MemoryStream ()) {
-        var bytes = code.InternalToByteArray (ByteOrder.Big);
-        buff.Write (bytes, 0, 2);
-        if (reason != null && reason.Length > 0) {
-          bytes = Encoding.UTF8.GetBytes (reason);
-          buff.Write (bytes, 0, bytes.Length);
-        }
+      var bytes = code.InternalToByteArray (ByteOrder.Big);
 
-        buff.Close ();
-        return buff.ToArray ();
-      }
+      if (reason == null || reason.Length == 0)
+        return bytes;
+
+      var buff = new List<byte> (bytes);
+      buff.AddRange (Encoding.UTF8.GetBytes (reason));
+
+      return buff.ToArray ();
     }
 
-    internal static string CheckIfCanRead (this Stream stream)
-    {
-      return stream == null
-             ? "'stream' is null."
-             : !stream.CanRead
-               ? "'stream' cannot be read."
-               : null;
-    }
-
-    internal static string CheckIfClosable (this WebSocketState state)
-    {
-      return state == WebSocketState.Closing
-             ? "While closing the WebSocket connection."
-             : state == WebSocketState.Closed
-               ? "The WebSocket connection has already been closed."
-               : null;
-    }
-
-    internal static string CheckIfConnectable (this WebSocketState state)
-    {
-      return state == WebSocketState.Open || state == WebSocketState.Closing
-             ? "A WebSocket connection has already been established."
-             : null;
-    }
-
-    internal static string CheckIfOpen (this WebSocketState state)
-    {
-      return state == WebSocketState.Connecting
-             ? "A WebSocket connection isn't established."
-             : state == WebSocketState.Closing
-               ? "While closing the WebSocket connection."
-               : state == WebSocketState.Closed
-                 ? "The WebSocket connection has already been closed."
-                 : null;
-    }
-
-    internal static string CheckIfStart (this ServerState state)
-    {
-      return state == ServerState.Ready
-             ? "The server hasn't yet started."
-             : state == ServerState.ShuttingDown
-               ? "The server is shutting down."
-               : state == ServerState.Stop
-                 ? "The server has already stopped."
-                 : null;
-    }
-
-    internal static string CheckIfStartable (this ServerState state)
-    {
-      return state == ServerState.Start
-             ? "The server has already started."
-             : state == ServerState.ShuttingDown
-               ? "The server is shutting down."
-               : null;
-    }
-
-    internal static string CheckIfValidProtocols (this string[] protocols)
-    {
-      return protocols.Contains (
-               protocol => protocol == null || protocol.Length == 0 || !protocol.IsToken ())
-             ? "Contains an invalid value."
-             : protocols.ContainsTwice ()
-               ? "Contains a value twice."
-               : null;
-    }
-
-    internal static string CheckIfValidSendData (this byte[] data)
-    {
-      return data == null
-             ? "'data' is null."
-             : null;
-    }
-
-    internal static string CheckIfValidSendData (this FileInfo file)
-    {
-      return file == null
-             ? "'file' is null."
-             : null;
-    }
-
-    internal static string CheckIfValidSendData (this string data)
-    {
-      return data == null
-             ? "'data' is null."
-             : null;
-    }
-
-    internal static string CheckIfValidServicePath (this string path)
-    {
-      return path == null || path.Length == 0
-             ? "'path' is null or empty."
-             : path[0] != '/'
-               ? "'path' isn't an absolute path."
-               : path.IndexOfAny (new[] { '?', '#' }) > -1
-                 ? "'path' includes either or both query and fragment components."
-                 : null;
-    }
-
-    internal static string CheckIfValidSessionID (this string id)
-    {
-      return id == null || id.Length == 0
-             ? "'id' is null or empty."
-             : null;
-    }
-
-    internal static string CheckIfValidWaitTime (this TimeSpan time)
-    {
-      return time <= TimeSpan.Zero
-             ? "A wait time is zero or less."
-             : null;
-    }
-
-    internal static void Close (this HttpListenerResponse response, HttpStatusCode code)
+    internal static void Close (
+      this HttpListenerResponse response, HttpStatusCode code
+    )
     {
       response.StatusCode = (int) code;
       response.OutputStream.Close ();
     }
 
     internal static void CloseWithAuthChallenge (
-      this HttpListenerResponse response, string challenge)
+      this HttpListenerResponse response, string challenge
+    )
     {
       response.Headers.InternalSet ("WWW-Authenticate", challenge, true);
       response.Close (HttpStatusCode.Unauthorized);
@@ -343,11 +214,62 @@ namespace WebSocketSharp
              : stream.ToByteArray ();
     }
 
-    internal static bool Contains<T> (this IEnumerable<T> source, Func<T, bool> condition)
+    /// <summary>
+    /// Determines whether the specified string contains any of characters in
+    /// the specified array of <see cref="char"/>.
+    /// </summary>
+    /// <returns>
+    /// <c>true</c> if <paramref name="value"/> contains any of characters in
+    /// <paramref name="anyOf"/>; otherwise, <c>false</c>.
+    /// </returns>
+    /// <param name="value">
+    /// A <see cref="string"/> to test.
+    /// </param>
+    /// <param name="anyOf">
+    /// An array of <see cref="char"/> that contains one or more characters to
+    /// seek.
+    /// </param>
+    internal static bool Contains (this string value, params char[] anyOf)
     {
-      foreach (T elm in source)
+      return anyOf != null && anyOf.Length > 0
+             ? value.IndexOfAny (anyOf) > -1
+             : false;
+    }
+
+    internal static bool Contains (
+      this NameValueCollection collection, string name
+    )
+    {
+      return collection[name] != null;
+    }
+
+    internal static bool Contains (
+      this NameValueCollection collection,
+      string name,
+      string value,
+      StringComparison comparisonTypeForValue
+    )
+    {
+      var val = collection[name];
+      if (val == null)
+        return false;
+
+      foreach (var elm in val.Split (',')) {
+        if (elm.Trim ().Equals (value, comparisonTypeForValue))
+          return true;
+      }
+
+      return false;
+    }
+
+    internal static bool Contains<T> (
+      this IEnumerable<T> source, Func<T, bool> condition
+    )
+    {
+      foreach (T elm in source) {
         if (condition (elm))
           return true;
+      }
 
       return false;
     }
@@ -355,21 +277,31 @@ namespace WebSocketSharp
     internal static bool ContainsTwice (this string[] values)
     {
       var len = values.Length;
+      var end = len - 1;
 
-      Func<int, bool> contains = null;
-      contains = idx => {
-        if (idx < len - 1) {
-          for (var i = idx + 1; i < len; i++)
-            if (values[i] == values[idx])
-              return true;
+      Func<int, bool> seek = null;
+      seek = idx => {
+               if (idx == end)
+                 return false;
 
-          return contains (++idx);
-        }
+               var val = values[idx];
+               for (var i = idx + 1; i < len; i++) {
+                 if (values[i] == val)
+                   return true;
+               }
 
-        return false;
-      };
+               return seek (++idx);
+             };
 
-      return contains (0);
+      return seek (0);
+    }
+
+    internal static T[] Copy<T> (this T[] source, int length)
+    {
+      var dest = new T[length];
+      Array.Copy (source, 0, dest, 0, length);
+
+      return dest;
     }
 
     internal static T[] Copy<T> (this T[] source, long length)
@@ -380,13 +312,60 @@ namespace WebSocketSharp
       return dest;
     }
 
-    internal static void CopyTo (this Stream source, Stream destination)
+    internal static void CopyTo (
+      this Stream source, Stream destination, int bufferLength
+    )
     {
-      var buffLen = 256;
-      var buff = new byte[buffLen];
-      var readLen = 0;
-      while ((readLen = source.Read (buff, 0, buffLen)) > 0)
-        destination.Write (buff, 0, readLen);
+      var buff = new byte[bufferLength];
+      var nread = 0;
+
+      while (true) {
+        nread = source.Read (buff, 0, bufferLength);
+        if (nread <= 0)
+          break;
+
+        destination.Write (buff, 0, nread);
+      }
+    }
+
+    internal static void CopyToAsync (
+      this Stream source,
+      Stream destination,
+      int bufferLength,
+      Action completed,
+      Action<Exception> error
+    )
+    {
+      var buff = new byte[bufferLength];
+
+      AsyncCallback callback = null;
+      callback =
+        ar => {
+          try {
+            var nread = source.EndRead (ar);
+            if (nread <= 0) {
+              if (completed != null)
+                completed ();
+
+              return;
+            }
+
+            destination.Write (buff, 0, nread);
+            source.BeginRead (buff, 0, bufferLength, callback, null);
+          }
+          catch (Exception ex) {
+            if (error != null)
+              error (ex);
+          }
+        };
+
+      try {
+        source.BeginRead (buff, 0, bufferLength, callback, null);
+      }
+      catch (Exception ex) {
+        if (error != null)
+          error (ex);
+      }
     }
 
     internal static byte[] Decompress (this byte[] data, CompressionMethod method)
@@ -454,10 +433,25 @@ namespace WebSocketSharp
       if (original[0] != '/')
         return null;
 
-      var i = original.IndexOfAny (new[] { '?', '#' });
-      return i > 0
-             ? original.Substring (0, i)
-             : original;
+      var idx = original.IndexOfAny (new[] { '?', '#' });
+      return idx > 0 ? original.Substring (0, idx) : original;
+    }
+
+    internal static CookieCollection GetCookies (
+      this NameValueCollection headers, bool response
+    )
+    {
+      var val = headers[response ? "Set-Cookie" : "Cookie"];
+      return val != null
+             ? CookieCollection.Parse (val, response)
+             : new CookieCollection ();
+    }
+
+    internal static string GetDnsSafeHost (this Uri uri, bool bracketIPv6)
+    {
+      return bracketIPv6 && uri.HostNameType == UriHostNameType.IPv6
+             ? uri.Host
+             : uri.DnsSafeHost;
     }
 
     internal static string GetMessage (this CloseStatusCode code)
@@ -484,92 +478,152 @@ namespace WebSocketSharp
     }
 
     /// <summary>
-    /// Gets the name from the specified <see cref="string"/> that contains a pair of name and
-    /// value separated by a separator character.
+    /// Gets the name from the specified string that contains a pair of
+    /// name and value separated by a character.
     /// </summary>
     /// <returns>
-    /// A <see cref="string"/> that represents the name if any; otherwise, <c>null</c>.
+    ///   <para>
+    ///   A <see cref="string"/> that represents the name.
+    ///   </para>
+    ///   <para>
+    ///   <see langword="null"/> if the name is not present.
+    ///   </para>
     /// </returns>
     /// <param name="nameAndValue">
-    /// A <see cref="string"/> that contains a pair of name and value separated by a separator
-    /// character.
+    /// A <see cref="string"/> that contains a pair of name and value.
     /// </param>
     /// <param name="separator">
-    /// A <see cref="char"/> that represents the separator character.
+    /// A <see cref="char"/> used to separate name and value.
     /// </param>
     internal static string GetName (this string nameAndValue, char separator)
     {
-      var i = nameAndValue.IndexOf (separator);
-      return i > 0
-             ? nameAndValue.Substring (0, i).Trim ()
-             : null;
+      var idx = nameAndValue.IndexOf (separator);
+      return idx > 0 ? nameAndValue.Substring (0, idx).Trim () : null;
+    }
+
+    internal static string GetUTF8DecodedString (this byte[] bytes)
+    {
+      return Encoding.UTF8.GetString (bytes);
+    }
+
+    internal static byte[] GetUTF8EncodedBytes (this string s)
+    {
+      return Encoding.UTF8.GetBytes (s);
     }
 
     /// <summary>
-    /// Gets the value from the specified <see cref="string"/> that contains a pair of name and
-    /// value separated by a separator character.
+    /// Gets the value from the specified string that contains a pair of
+    /// name and value separated by a character.
     /// </summary>
     /// <returns>
-    /// A <see cref="string"/> that represents the value if any; otherwise, <c>null</c>.
+    ///   <para>
+    ///   A <see cref="string"/> that represents the value.
+    ///   </para>
+    ///   <para>
+    ///   <see langword="null"/> if the value is not present.
+    ///   </para>
     /// </returns>
     /// <param name="nameAndValue">
-    /// A <see cref="string"/> that contains a pair of name and value separated by a separator
-    /// character.
+    /// A <see cref="string"/> that contains a pair of name and value.
     /// </param>
     /// <param name="separator">
-    /// A <see cref="char"/> that represents the separator character.
+    /// A <see cref="char"/> used to separate name and value.
     /// </param>
     internal static string GetValue (this string nameAndValue, char separator)
     {
-      var i = nameAndValue.IndexOf (separator);
-      return i > -1 && i < nameAndValue.Length - 1
-             ? nameAndValue.Substring (i + 1).Trim ()
-             : null;
+      return nameAndValue.GetValue (separator, false);
     }
 
-    internal static string GetValue (this string nameAndValue, char separator, bool unquote)
+    /// <summary>
+    /// Gets the value from the specified string that contains a pair of
+    /// name and value separated by a character.
+    /// </summary>
+    /// <returns>
+    ///   <para>
+    ///   A <see cref="string"/> that represents the value.
+    ///   </para>
+    ///   <para>
+    ///   <see langword="null"/> if the value is not present.
+    ///   </para>
+    /// </returns>
+    /// <param name="nameAndValue">
+    /// A <see cref="string"/> that contains a pair of name and value.
+    /// </param>
+    /// <param name="separator">
+    /// A <see cref="char"/> used to separate name and value.
+    /// </param>
+    /// <param name="unquote">
+    /// A <see cref="bool"/>: <c>true</c> if unquotes the value; otherwise,
+    /// <c>false</c>.
+    /// </param>
+    internal static string GetValue (
+      this string nameAndValue, char separator, bool unquote
+    )
     {
-      var i = nameAndValue.IndexOf (separator);
-      if (i < 0 || i == nameAndValue.Length - 1)
+      var idx = nameAndValue.IndexOf (separator);
+      if (idx < 0 || idx == nameAndValue.Length - 1)
         return null;
 
-      var val = nameAndValue.Substring (i + 1).Trim ();
-      return unquote
-             ? val.Unquote ()
-             : val;
+      var val = nameAndValue.Substring (idx + 1).Trim ();
+      return unquote ? val.Unquote () : val;
     }
 
-    internal static TcpListenerWebSocketContext GetWebSocketContext (
-      this TcpClient tcpClient,
-      string protocol,
-      bool secure,
-      ServerSslConfiguration sslConfig,
-      Logger logger)
+    internal static byte[] InternalToByteArray (
+      this ushort value, ByteOrder order
+    )
     {
-      return new TcpListenerWebSocketContext (tcpClient, protocol, secure, sslConfig, logger);
-    }
+      var ret = BitConverter.GetBytes (value);
 
-    internal static byte[] InternalToByteArray (this ushort value, ByteOrder order)
-    {
-      var bytes = BitConverter.GetBytes (value);
       if (!order.IsHostOrder ())
-        Array.Reverse (bytes);
+        Array.Reverse (ret);
 
-      return bytes;
+      return ret;
     }
 
-    internal static byte[] InternalToByteArray (this ulong value, ByteOrder order)
+    internal static byte[] InternalToByteArray (
+      this ulong value, ByteOrder order
+    )
     {
-      var bytes = BitConverter.GetBytes (value);
-      if (!order.IsHostOrder ())
-        Array.Reverse (bytes);
+      var ret = BitConverter.GetBytes (value);
 
-      return bytes;
+      if (!order.IsHostOrder ())
+        Array.Reverse (ret);
+
+      return ret;
     }
 
-    internal static bool IsCompressionExtension (this string value, CompressionMethod method)
+    internal static bool IsCompressionExtension (
+      this string value, CompressionMethod method
+    )
     {
       return value.StartsWith (method.ToExtensionString ());
+    }
+
+    internal static bool IsControl (this byte opcode)
+    {
+      return opcode > 0x7 && opcode < 0x10;
+    }
+
+    internal static bool IsControl (this Opcode opcode)
+    {
+      return opcode >= Opcode.Close;
+    }
+
+    internal static bool IsData (this byte opcode)
+    {
+      return opcode == 0x1 || opcode == 0x2;
+    }
+
+    internal static bool IsData (this Opcode opcode)
+    {
+      return opcode == Opcode.Text || opcode == Opcode.Binary;
+    }
+
+    internal static bool IsHttpMethod (this string value, Version version)
+    {
+      return version == HttpVersion.Version10
+             ? value.isHttpMethod10 ()
+             : value.isHttpMethod ();
     }
 
     internal static bool IsPortNumber (this int value)
@@ -579,36 +633,50 @@ namespace WebSocketSharp
 
     internal static bool IsReserved (this ushort code)
     {
-      return code == (ushort) CloseStatusCode.Undefined ||
-             code == (ushort) CloseStatusCode.NoStatus ||
-             code == (ushort) CloseStatusCode.Abnormal ||
-             code == (ushort) CloseStatusCode.TlsHandshakeFailure;
+      return code == 1004
+             || code == 1005
+             || code == 1006
+             || code == 1015;
     }
 
     internal static bool IsReserved (this CloseStatusCode code)
     {
-      return code == CloseStatusCode.Undefined ||
-             code == CloseStatusCode.NoStatus ||
-             code == CloseStatusCode.Abnormal ||
-             code == CloseStatusCode.TlsHandshakeFailure;
+      return code == CloseStatusCode.Undefined
+             || code == CloseStatusCode.NoStatus
+             || code == CloseStatusCode.Abnormal
+             || code == CloseStatusCode.TlsHandshakeFailure;
+    }
+
+    internal static bool IsSupported (this byte opcode)
+    {
+      return Enum.IsDefined (typeof (Opcode), opcode);
     }
 
     internal static bool IsText (this string value)
     {
       var len = value.Length;
+
       for (var i = 0; i < len; i++) {
         var c = value[i];
-        if (c < 0x20 && !"\r\n\t".Contains (c))
-          return false;
+        if (c < 0x20) {
+          if ("\r\n\t".IndexOf (c) == -1)
+            return false;
+
+          if (c == '\n') {
+            i++;
+            if (i == len)
+              break;
+
+            c = value[i];
+            if (" \t".IndexOf (c) == -1)
+              return false;
+          }
+
+          continue;
+        }
 
         if (c == 0x7f)
           return false;
-
-        if (c == '\n' && ++i < len) {
-          c = value[i];
-          if (!" \t".Contains (c))
-            return false;
-        }
       }
 
       return true;
@@ -616,11 +684,28 @@ namespace WebSocketSharp
 
     internal static bool IsToken (this string value)
     {
-      foreach (var c in value)
-        if (c < 0x20 || c >= 0x7f || _tspecials.Contains (c))
+      foreach (var c in value) {
+        if (c < 0x20)
           return false;
 
+        if (c > 0x7e)
+          return false;
+
+        if (_tspecials.IndexOf (c) > -1)
+          return false;
+      }
+
       return true;
+    }
+
+    internal static bool KeepsAlive (
+      this NameValueCollection headers, Version version
+    )
+    {
+      var comparison = StringComparison.OrdinalIgnoreCase;
+      return version < HttpVersion.Version11
+             ? headers.Contains ("Connection", "keep-alive", comparison)
+             : !headers.Contains ("Connection", "close", comparison);
     }
 
     internal static string Quote (this string value)
@@ -630,138 +715,269 @@ namespace WebSocketSharp
 
     internal static byte[] ReadBytes (this Stream stream, int length)
     {
-      return stream.readBytes (new byte[length], 0, length);
-    }
+      var buff = new byte[length];
+      var offset = 0;
+      var retry = 0;
+      var nread = 0;
 
-    internal static byte[] ReadBytes (this Stream stream, long length, int bufferLength)
-    {
-      using (var res = new MemoryStream ()) {
-        var cnt = length / bufferLength;
-        var rem = (int) (length % bufferLength);
-
-        var buff = new byte[bufferLength];
-        var end = false;
-        for (long i = 0; i < cnt; i++) {
-          if (!stream.readBytes (buff, 0, bufferLength, res)) {
-            end = true;
-            break;
+      while (length > 0) {
+        nread = stream.Read (buff, offset, length);
+        if (nread <= 0) {
+          if (retry < _retry) {
+            retry++;
+            continue;
           }
+
+          return buff.SubArray (0, offset);
         }
 
-        if (!end && rem > 0)
-          stream.readBytes (new byte[rem], 0, rem, res);
+        retry = 0;
 
-        res.Close ();
-        return res.ToArray ();
+        offset += nread;
+        length -= nread;
+      }
+
+      return buff;
+    }
+
+    internal static byte[] ReadBytes (
+      this Stream stream, long length, int bufferLength
+    )
+    {
+      using (var dest = new MemoryStream ()) {
+        var buff = new byte[bufferLength];
+        var retry = 0;
+        var nread = 0;
+
+        while (length > 0) {
+          if (length < bufferLength)
+            bufferLength = (int) length;
+
+          nread = stream.Read (buff, 0, bufferLength);
+          if (nread <= 0) {
+            if (retry < _retry) {
+              retry++;
+              continue;
+            }
+
+            break;
+          }
+
+          retry = 0;
+
+          dest.Write (buff, 0, nread);
+          length -= nread;
+        }
+
+        dest.Close ();
+        return dest.ToArray ();
       }
     }
 
     internal static void ReadBytesAsync (
-      this Stream stream, int length, Action<byte[]> completed, Action<Exception> error)
+      this Stream stream,
+      int length,
+      Action<byte[]> completed,
+      Action<Exception> error
+    )
     {
       var buff = new byte[length];
-      stream.BeginRead (
-        buff,
-        0,
-        length,
+      var offset = 0;
+      var retry = 0;
+
+      AsyncCallback callback = null;
+      callback =
         ar => {
           try {
-            byte[] bytes = null;
-            try {
-              var len = stream.EndRead (ar);
-              bytes = len < 1
-                      ? new byte[0]
-                      : len < length
-                        ? stream.readBytes (buff, len, length - len)
-                        : buff;
-            }
-            catch {
-              bytes = new byte[0];
+            var nread = stream.EndRead (ar);
+            if (nread <= 0) {
+              if (retry < _retry) {
+                retry++;
+                stream.BeginRead (buff, offset, length, callback, null);
+
+                return;
+              }
+
+              if (completed != null)
+                completed (buff.SubArray (0, offset));
+
+              return;
             }
 
-            if (completed != null)
-              completed (bytes);
+            if (nread == length) {
+              if (completed != null)
+                completed (buff);
+
+              return;
+            }
+
+            retry = 0;
+
+            offset += nread;
+            length -= nread;
+
+            stream.BeginRead (buff, offset, length, callback, null);
           }
           catch (Exception ex) {
             if (error != null)
               error (ex);
           }
-        },
-        null);
+        };
+
+      try {
+        stream.BeginRead (buff, offset, length, callback, null);
+      }
+      catch (Exception ex) {
+        if (error != null)
+          error (ex);
+      }
     }
 
-    internal static string RemovePrefix (this string value, params string[] prefixes)
+    internal static void ReadBytesAsync (
+      this Stream stream,
+      long length,
+      int bufferLength,
+      Action<byte[]> completed,
+      Action<Exception> error
+    )
     {
-      var i = 0;
-      foreach (var prefix in prefixes) {
-        if (value.StartsWith (prefix)) {
-          i = prefix.Length;
-          break;
-        }
-      }
+      var dest = new MemoryStream ();
+      var buff = new byte[bufferLength];
+      var retry = 0;
 
-      return i > 0
-             ? value.Substring (i)
-             : value;
+      Action<long> read = null;
+      read =
+        len => {
+          if (len < bufferLength)
+            bufferLength = (int) len;
+
+          stream.BeginRead (
+            buff,
+            0,
+            bufferLength,
+            ar => {
+              try {
+                var nread = stream.EndRead (ar);
+                if (nread <= 0) {
+                  if (retry < _retry) {
+                    retry++;
+                    read (len);
+
+                    return;
+                  }
+
+                  if (completed != null) {
+                    dest.Close ();
+                    completed (dest.ToArray ());
+                  }
+
+                  dest.Dispose ();
+                  return;
+                }
+
+                dest.Write (buff, 0, nread);
+
+                if (nread == len) {
+                  if (completed != null) {
+                    dest.Close ();
+                    completed (dest.ToArray ());
+                  }
+
+                  dest.Dispose ();
+                  return;
+                }
+
+                retry = 0;
+
+                read (len - nread);
+              }
+              catch (Exception ex) {
+                dest.Dispose ();
+                if (error != null)
+                  error (ex);
+              }
+            },
+            null
+          );
+        };
+
+      try {
+        read (length);
+      }
+      catch (Exception ex) {
+        dest.Dispose ();
+        if (error != null)
+          error (ex);
+      }
     }
 
     internal static T[] Reverse<T> (this T[] array)
     {
       var len = array.Length;
-      var reverse = new T[len];
+      var ret = new T[len];
 
       var end = len - 1;
       for (var i = 0; i <= end; i++)
-        reverse[i] = array[end - i];
+        ret[i] = array[end - i];
 
-      return reverse;
+      return ret;
     }
 
     internal static IEnumerable<string> SplitHeaderValue (
-      this string value, params char[] separators)
+      this string value, params char[] separators
+    )
     {
       var len = value.Length;
-      var seps = new string (separators);
 
       var buff = new StringBuilder (32);
+      var end = len - 1;
       var escaped = false;
       var quoted = false;
 
-      for (var i = 0; i < len; i++) {
+      for (var i = 0; i <= end; i++) {
         var c = value[i];
-        if (c == '"') {
-          if (escaped)
-            escaped = !escaped;
-          else
-            quoted = !quoted;
-        }
-        else if (c == '\\') {
-          if (i < len - 1 && value[i + 1] == '"')
-            escaped = true;
-        }
-        else if (seps.Contains (c)) {
-          if (!quoted) {
-            yield return buff.ToString ();
-            buff.Length = 0;
+        buff.Append (c);
 
+        if (c == '"') {
+          if (escaped) {
+            escaped = false;
             continue;
           }
-        }
-        else {
+
+          quoted = !quoted;
+          continue;
         }
 
-        buff.Append (c);
+        if (c == '\\') {
+          if (i == end)
+            break;
+
+          if (value[i + 1] == '"')
+            escaped = true;
+
+          continue;
+        }
+
+        if (Array.IndexOf (separators, c) > -1) {
+          if (quoted)
+            continue;
+
+          buff.Length -= 1;
+          yield return buff.ToString ();
+
+          buff.Length = 0;
+          continue;
+        }
       }
 
-      if (buff.Length > 0)
-        yield return buff.ToString ();
+      yield return buff.ToString ();
     }
 
     internal static byte[] ToByteArray (this Stream stream)
     {
       using (var output = new MemoryStream ()) {
         stream.Position = 0;
-        stream.CopyTo (output);
+        stream.CopyTo (output, 1024);
         output.Close ();
 
         return output.ToArray ();
@@ -770,30 +986,42 @@ namespace WebSocketSharp
 
     internal static CompressionMethod ToCompressionMethod (this string value)
     {
-      foreach (CompressionMethod method in Enum.GetValues (typeof (CompressionMethod)))
+      var methods = Enum.GetValues (typeof (CompressionMethod));
+      foreach (CompressionMethod method in methods) {
         if (method.ToExtensionString () == value)
           return method;
+      }
 
       return CompressionMethod.None;
     }
 
     internal static string ToExtensionString (
-      this CompressionMethod method, params string[] parameters)
+      this CompressionMethod method, params string[] parameters
+    )
     {
       if (method == CompressionMethod.None)
         return String.Empty;
 
-      var m = String.Format ("permessage-{0}", method.ToString ().ToLower ());
-      if (parameters == null || parameters.Length == 0)
-        return m;
+      var name = String.Format (
+                   "permessage-{0}", method.ToString ().ToLower ()
+                 );
 
-      return String.Format ("{0}; {1}", m, parameters.ToString ("; "));
+      return parameters != null && parameters.Length > 0
+             ? String.Format ("{0}; {1}", name, parameters.ToString ("; "))
+             : name;
     }
 
-    internal static System.Net.IPAddress ToIPAddress (this string hostNameOrAddress)
+    internal static System.Net.IPAddress ToIPAddress (this string value)
     {
+      if (value == null || value.Length == 0)
+        return null;
+
+      System.Net.IPAddress addr;
+      if (System.Net.IPAddress.TryParse (value, out addr))
+        return addr;
+
       try {
-        var addrs = System.Net.Dns.GetHostAddresses (hostNameOrAddress);
+        var addrs = System.Net.Dns.GetHostAddresses (value);
         return addrs[0];
       }
       catch {
@@ -801,9 +1029,21 @@ namespace WebSocketSharp
       }
     }
 
-    internal static List<TSource> ToList<TSource> (this IEnumerable<TSource> source)
+    internal static List<TSource> ToList<TSource> (
+      this IEnumerable<TSource> source
+    )
     {
       return new List<TSource> (source);
+    }
+
+    internal static string ToString (
+      this System.Net.IPAddress address, bool bracketIPv6
+    )
+    {
+      return bracketIPv6
+             && address.AddressFamily == AddressFamily.InterNetworkV6
+             ? String.Format ("[{0}]", address.ToString ())
+             : address.ToString ();
     }
 
     internal static ushort ToUInt16 (this byte[] source, ByteOrder sourceOrder)
@@ -816,74 +1056,151 @@ namespace WebSocketSharp
       return BitConverter.ToUInt64 (source.ToHostOrder (sourceOrder), 0);
     }
 
-    internal static string TrimEndSlash (this string value)
+    internal static IEnumerable<string> Trim (this IEnumerable<string> source)
     {
-      value = value.TrimEnd ('/');
-      return value.Length > 0
-             ? value
-             : "/";
+      foreach (var elm in source)
+        yield return elm.Trim ();
     }
 
-    /// <summary>
-    /// Tries to create a <see cref="Uri"/> for WebSocket with the specified
-    /// <paramref name="uriString"/>.
-    /// </summary>
-    /// <returns>
-    /// <c>true</c> if a <see cref="Uri"/> is successfully created; otherwise, <c>false</c>.
-    /// </returns>
-    /// <param name="uriString">
-    /// A <see cref="string"/> that represents the WebSocket URL to try.
-    /// </param>
-    /// <param name="result">
-    /// When this method returns, a <see cref="Uri"/> that represents the WebSocket URL
-    /// if <paramref name="uriString"/> is valid; otherwise, <see langword="null"/>.
-    /// </param>
-    /// <param name="message">
-    /// When this method returns, a <see cref="string"/> that represents the error message
-    /// if <paramref name="uriString"/> is invalid; otherwise, <see cref="String.Empty"/>.
-    /// </param>
-    internal static bool TryCreateWebSocketUri (
-      this string uriString, out Uri result, out string message)
+    internal static string TrimSlashFromEnd (this string value)
+    {
+      var ret = value.TrimEnd ('/');
+      return ret.Length > 0 ? ret : "/";
+    }
+
+    internal static string TrimSlashOrBackslashFromEnd (this string value)
+    {
+      var ret = value.TrimEnd ('/', '\\');
+      return ret.Length > 0 ? ret : value[0].ToString ();
+    }
+
+    internal static bool TryCreateVersion (
+      this string versionString, out Version result
+    )
     {
       result = null;
 
+      try {
+        result = new Version (versionString);
+      }
+      catch {
+        return false;
+      }
+
+      return true;
+    }
+
+    /// <summary>
+    /// Tries to create a new <see cref="Uri"/> for WebSocket with
+    /// the specified <paramref name="uriString"/>.
+    /// </summary>
+    /// <returns>
+    /// <c>true</c> if the <see cref="Uri"/> was successfully created;
+    /// otherwise, <c>false</c>.
+    /// </returns>
+    /// <param name="uriString">
+    /// A <see cref="string"/> that represents a WebSocket URL to try.
+    /// </param>
+    /// <param name="result">
+    /// When this method returns, a <see cref="Uri"/> that
+    /// represents the WebSocket URL or <see langword="null"/>
+    /// if <paramref name="uriString"/> is invalid.
+    /// </param>
+    /// <param name="message">
+    /// When this method returns, a <see cref="string"/> that
+    /// represents an error message or <see langword="null"/>
+    /// if <paramref name="uriString"/> is valid.
+    /// </param>
+    internal static bool TryCreateWebSocketUri (
+      this string uriString, out Uri result, out string message
+    )
+    {
+      result = null;
+      message = null;
+
       var uri = uriString.ToUri ();
+      if (uri == null) {
+        message = "An invalid URI string.";
+        return false;
+      }
+
       if (!uri.IsAbsoluteUri) {
-        message = "Not an absolute URI: " + uriString;
+        message = "A relative URI.";
         return false;
       }
 
       var schm = uri.Scheme;
-      if (schm != "ws" && schm != "wss") {
-        message = "The scheme part isn't 'ws' or 'wss': " + uriString;
-        return false;
-      }
-
-      if (uri.Fragment.Length > 0) {
-        message = "Includes the fragment component: " + uriString;
+      if (!(schm == "ws" || schm == "wss")) {
+        message = "The scheme part is not 'ws' or 'wss'.";
         return false;
       }
 
       var port = uri.Port;
-      if (port > 0) {
-        if (port > 65535) {
-          message = "The port part is greater than 65535: " + uriString;
-          return false;
-        }
-
-        if ((schm == "ws" && port == 443) || (schm == "wss" && port == 80)) {
-          message = "An invalid pair of scheme and port: " + uriString;
-          return false;
-        }
-      }
-      else {
-        uri = new Uri (
-          String.Format (
-            "{0}://{1}:{2}{3}", schm, uri.Host, schm == "ws" ? 80 : 443, uri.PathAndQuery));
+      if (port == 0) {
+        message = "The port part is zero.";
+        return false;
       }
 
-      result = uri;
-      message = String.Empty;
+      if (uri.Fragment.Length > 0) {
+        message = "It includes the fragment component.";
+        return false;
+      }
+
+      result = port != -1
+               ? uri
+               : new Uri (
+                   String.Format (
+                     "{0}://{1}:{2}{3}",
+                     schm,
+                     uri.Host,
+                     schm == "ws" ? 80 : 443,
+                     uri.PathAndQuery
+                   )
+                 );
+
+      return true;
+    }
+
+    internal static bool TryGetUTF8DecodedString (this byte[] bytes, out string s)
+    {
+      s = null;
+
+      try {
+        s = Encoding.UTF8.GetString (bytes);
+      }
+      catch {
+        return false;
+      }
+
+      return true;
+    }
+
+    internal static bool TryGetUTF8EncodedBytes (this string s, out byte[] bytes)
+    {
+      bytes = null;
+
+      try {
+        bytes = Encoding.UTF8.GetBytes (s);
+      }
+      catch {
+        return false;
+      }
+
+      return true;
+    }
+
+    internal static bool TryOpenRead (
+      this FileInfo fileInfo, out FileStream fileStream
+    )
+    {
+      fileStream = null;
+
+      try {
+        fileStream = fileInfo.OpenRead ();
+      }
+      catch {
+        return false;
+      }
 
       return true;
     }
@@ -891,105 +1208,75 @@ namespace WebSocketSharp
     internal static string Unquote (this string value)
     {
       var start = value.IndexOf ('"');
-      if (start < 0)
+      if (start == -1)
         return value;
 
       var end = value.LastIndexOf ('"');
-      var len = end - start - 1;
+      if (end == start)
+        return value;
 
-      return len < 0
-             ? value
-             : len == 0
-               ? String.Empty
-               : value.Substring (start + 1, len).Replace ("\\\"", "\"");
+      var len = end - start - 1;
+      return len > 0
+             ? value.Substring (start + 1, len).Replace ("\\\"", "\"")
+             : String.Empty;
     }
 
-    internal static void WriteBytes (this Stream stream, byte[] bytes)
+    internal static bool Upgrades (
+      this NameValueCollection headers, string protocol
+    )
     {
-      using (var input = new MemoryStream (bytes))
-        input.CopyTo (stream);
+      var comparison = StringComparison.OrdinalIgnoreCase;
+      return headers.Contains ("Upgrade", protocol, comparison)
+             && headers.Contains ("Connection", "Upgrade", comparison);
+    }
+
+    internal static string UrlDecode (this string value, Encoding encoding)
+    {
+      return HttpUtility.UrlDecode (value, encoding);
+    }
+
+    internal static string UrlEncode (this string value, Encoding encoding)
+    {
+      return HttpUtility.UrlEncode (value, encoding);
+    }
+
+    internal static void WriteBytes (
+      this Stream stream, byte[] bytes, int bufferLength
+    )
+    {
+      using (var src = new MemoryStream (bytes))
+        src.CopyTo (stream, bufferLength);
+    }
+
+    internal static void WriteBytesAsync (
+      this Stream stream,
+      byte[] bytes,
+      int bufferLength,
+      Action completed,
+      Action<Exception> error
+    )
+    {
+      var src = new MemoryStream (bytes);
+      src.CopyToAsync (
+        stream,
+        bufferLength,
+        () => {
+          if (completed != null)
+            completed ();
+
+          src.Dispose ();
+        },
+        ex => {
+          src.Dispose ();
+          if (error != null)
+            error (ex);
+        }
+      );
     }
 
     #endregion
 
     #region Public Methods
-
-    /// <summary>
-    /// Determines whether the specified <see cref="string"/> contains any of characters
-    /// in the specified array of <see cref="char"/>.
-    /// </summary>
-    /// <returns>
-    /// <c>true</c> if <paramref name="value"/> contains any of <paramref name="chars"/>;
-    /// otherwise, <c>false</c>.
-    /// </returns>
-    /// <param name="value">
-    /// A <see cref="string"/> to test.
-    /// </param>
-    /// <param name="chars">
-    /// An array of <see cref="char"/> that contains characters to find.
-    /// </param>
-    public static bool Contains (this string value, params char[] chars)
-    {
-      return chars == null || chars.Length == 0
-             ? true
-             : value == null || value.Length == 0
-               ? false
-               : value.IndexOfAny (chars) > -1;
-    }
-
-    /// <summary>
-    /// Determines whether the specified <see cref="NameValueCollection"/> contains the entry
-    /// with the specified <paramref name="name"/>.
-    /// </summary>
-    /// <returns>
-    /// <c>true</c> if <paramref name="collection"/> contains the entry
-    /// with <paramref name="name"/>; otherwise, <c>false</c>.
-    /// </returns>
-    /// <param name="collection">
-    /// A <see cref="NameValueCollection"/> to test.
-    /// </param>
-    /// <param name="name">
-    /// A <see cref="string"/> that represents the key of the entry to find.
-    /// </param>
-    public static bool Contains (this NameValueCollection collection, string name)
-    {
-      return collection != null && collection.Count > 0
-             ? collection[name] != null
-             : false;
-    }
-
-    /// <summary>
-    /// Determines whether the specified <see cref="NameValueCollection"/> contains the entry
-    /// with the specified both <paramref name="name"/> and <paramref name="value"/>.
-    /// </summary>
-    /// <returns>
-    /// <c>true</c> if <paramref name="collection"/> contains the entry with both
-    /// <paramref name="name"/> and <paramref name="value"/>; otherwise, <c>false</c>.
-    /// </returns>
-    /// <param name="collection">
-    /// A <see cref="NameValueCollection"/> to test.
-    /// </param>
-    /// <param name="name">
-    /// A <see cref="string"/> that represents the key of the entry to find.
-    /// </param>
-    /// <param name="value">
-    /// A <see cref="string"/> that represents the value of the entry to find.
-    /// </param>
-    public static bool Contains (this NameValueCollection collection, string name, string value)
-    {
-      if (collection == null || collection.Count == 0)
-        return false;
-
-      var vals = collection[name];
-      if (vals == null)
-        return false;
-
-      foreach (var val in vals.Split (','))
-        if (val.Trim ().Equals (value, StringComparison.OrdinalIgnoreCase))
-          return true;
-
-      return false;
-    }
 
     /// <summary>
     /// Emits the specified <see cref="EventHandler"/> delegate if it isn't <see langword="null"/>.
@@ -1010,8 +1297,8 @@ namespace WebSocketSharp
     }
 
     /// <summary>
-    /// Emits the specified <c>EventHandler&lt;TEventArgs&gt;</c> delegate
-    /// if it isn't <see langword="null"/>.
+    /// Emits the specified <c>EventHandler&lt;TEventArgs&gt;</c> delegate if it isn't
+    /// <see langword="null"/>.
     /// </summary>
     /// <param name="eventHandler">
     /// An <c>EventHandler&lt;TEventArgs&gt;</c> to emit.
@@ -1031,27 +1318,6 @@ namespace WebSocketSharp
     {
       if (eventHandler != null)
         eventHandler (sender, e);
-    }
-
-    /// <summary>
-    /// Gets the collection of the HTTP cookies from the specified HTTP <paramref name="headers"/>.
-    /// </summary>
-    /// <returns>
-    /// A <see cref="CookieCollection"/> that receives a collection of the HTTP cookies.
-    /// </returns>
-    /// <param name="headers">
-    /// A <see cref="NameValueCollection"/> that contains a collection of the HTTP headers.
-    /// </param>
-    /// <param name="response">
-    /// <c>true</c> if <paramref name="headers"/> is a collection of the response headers;
-    /// otherwise, <c>false</c>.
-    /// </param>
-    public static CookieCollection GetCookies (this NameValueCollection headers, bool response)
-    {
-      var name = response ? "Set-Cookie" : "Cookie";
-      return headers != null && headers.Contains (name)
-             ? CookieCollection.Parse (headers[name], response)
-             : new CookieCollection ();
     }
 
     /// <summary>
@@ -1132,27 +1398,36 @@ namespace WebSocketSharp
     }
 
     /// <summary>
-    /// Determines whether the specified <see cref="ushort"/> is in the allowable range of
-    /// the WebSocket close status code.
+    /// Determines whether the specified ushort is in the range of
+    /// the status code for the WebSocket connection close.
     /// </summary>
     /// <remarks>
-    /// Not allowable ranges are the following:
+    ///   <para>
+    ///   The ranges are the following:
+    ///   </para>
     ///   <list type="bullet">
     ///     <item>
     ///       <term>
-    ///       Numbers in the range 0-999 are not used.
+    ///       1000-2999: These numbers are reserved for definition by
+    ///       the WebSocket protocol.
     ///       </term>
     ///     </item>
     ///     <item>
     ///       <term>
-    ///       Numbers greater than 4999 are out of the reserved close status code ranges.
+    ///       3000-3999: These numbers are reserved for use by libraries,
+    ///       frameworks, and applications.
+    ///       </term>
+    ///     </item>
+    ///     <item>
+    ///       <term>
+    ///       4000-4999: These numbers are reserved for private use.
     ///       </term>
     ///     </item>
     ///   </list>
     /// </remarks>
     /// <returns>
-    /// <c>true</c> if <paramref name="value"/> is in the allowable range of the WebSocket
-    /// close status code; otherwise, <c>false</c>.
+    /// <c>true</c> if <paramref name="value"/> is in the range of
+    /// the status code for the close; otherwise, <c>false</c>.
     /// </returns>
     /// <param name="value">
     /// A <see cref="ushort"/> to test.
@@ -1163,50 +1438,57 @@ namespace WebSocketSharp
     }
 
     /// <summary>
-    /// Determines whether the specified <see cref="string"/> is enclosed in the specified
-    /// <see cref="char"/>.
+    /// Determines whether the specified string is enclosed in
+    /// the specified character.
     /// </summary>
     /// <returns>
-    /// <c>true</c> if <paramref name="value"/> is enclosed in <paramref name="c"/>;
-    /// otherwise, <c>false</c>.
+    /// <c>true</c> if <paramref name="value"/> is enclosed in
+    /// <paramref name="c"/>; otherwise, <c>false</c>.
     /// </returns>
     /// <param name="value">
     /// A <see cref="string"/> to test.
     /// </param>
     /// <param name="c">
-    /// A <see cref="char"/> that represents the character to find.
+    /// A <see cref="char"/> to find.
     /// </param>
     public static bool IsEnclosedIn (this string value, char c)
     {
-      return value != null &&
-             value.Length > 1 &&
-             value[0] == c &&
-             value[value.Length - 1] == c;
+      if (value == null)
+        return false;
+
+      var len = value.Length;
+      if (len < 2)
+        return false;
+
+      return value[0] == c && value[len - 1] == c;
     }
 
     /// <summary>
-    /// Determines whether the specified <see cref="ByteOrder"/> is host (this computer
+    /// Determines whether the specified byte order is host (this computer
     /// architecture) byte order.
     /// </summary>
     /// <returns>
-    /// <c>true</c> if <paramref name="order"/> is host byte order; otherwise, <c>false</c>.
+    /// <c>true</c> if <paramref name="order"/> is host byte order; otherwise,
+    /// <c>false</c>.
     /// </returns>
     /// <param name="order">
-    /// One of the <see cref="ByteOrder"/> enum values, to test.
+    /// One of the <see cref="ByteOrder"/> enum values to test.
     /// </param>
     public static bool IsHostOrder (this ByteOrder order)
     {
-      // true : !(true ^ true)  or !(false ^ false)
+      // true: !(true ^ true) or !(false ^ false)
       // false: !(true ^ false) or !(false ^ true)
       return !(BitConverter.IsLittleEndian ^ (order == ByteOrder.Little));
     }
 
     /// <summary>
-    /// Determines whether the specified <see cref="System.Net.IPAddress"/> represents
-    /// the local IP address.
+    /// Determines whether the specified IP address is a local IP address.
     /// </summary>
+    /// <remarks>
+    /// This local means NOT REMOTE for the current host.
+    /// </remarks>
     /// <returns>
-    /// <c>true</c> if <paramref name="address"/> represents the local IP address;
+    /// <c>true</c> if <paramref name="address"/> is a local IP address;
     /// otherwise, <c>false</c>.
     /// </returns>
     /// <param name="address">
@@ -1220,24 +1502,37 @@ namespace WebSocketSharp
       if (address == null)
         throw new ArgumentNullException ("address");
 
-      if (address.Equals (System.Net.IPAddress.Any) || System.Net.IPAddress.IsLoopback (address))
+      if (address.Equals (System.Net.IPAddress.Any))
         return true;
+
+      if (address.Equals (System.Net.IPAddress.Loopback))
+        return true;
+
+      if (Socket.OSSupportsIPv6) {
+        if (address.Equals (System.Net.IPAddress.IPv6Any))
+          return true;
+
+        if (address.Equals (System.Net.IPAddress.IPv6Loopback))
+          return true;
+      }
 
       var host = System.Net.Dns.GetHostName ();
       var addrs = System.Net.Dns.GetHostAddresses (host);
-      foreach (var addr in addrs)
+      foreach (var addr in addrs) {
         if (address.Equals (addr))
           return true;
+      }
 
       return false;
     }
 
     /// <summary>
-    /// Determines whether the specified <see cref="string"/> is <see langword="null"/> or empty.
+    /// Determines whether the specified string is <see langword="null"/> or
+    /// an empty string.
     /// </summary>
     /// <returns>
-    /// <c>true</c> if <paramref name="value"/> is <see langword="null"/> or empty;
-    /// otherwise, <c>false</c>.
+    /// <c>true</c> if <paramref name="value"/> is <see langword="null"/> or
+    /// an empty string; otherwise, <c>false</c>.
     /// </returns>
     /// <param name="value">
     /// A <see cref="string"/> to test.
@@ -1248,10 +1543,11 @@ namespace WebSocketSharp
     }
 
     /// <summary>
-    /// Determines whether the specified <see cref="string"/> is a predefined scheme.
+    /// Determines whether the specified string is a predefined scheme.
     /// </summary>
     /// <returns>
-    /// <c>true</c> if <paramref name="value"/> is a predefined scheme; otherwise, <c>false</c>.
+    /// <c>true</c> if <paramref name="value"/> is a predefined scheme;
+    /// otherwise, <c>false</c>.
     /// </returns>
     /// <param name="value">
     /// A <see cref="string"/> to test.
@@ -1271,6 +1567,12 @@ namespace WebSocketSharp
       if (c == 'f')
         return value == "file" || value == "ftp";
 
+      if (c == 'g')
+        return value == "gopher";
+
+      if (c == 'm')
+        return value == "mailto";
+
       if (c == 'n') {
         c = value[1];
         return c == 'e'
@@ -1278,107 +1580,111 @@ namespace WebSocketSharp
                : value == "nntp";
       }
 
-      return (c == 'g' && value == "gopher") || (c == 'm' && value == "mailto");
+      return false;
     }
 
     /// <summary>
-    /// Determines whether the specified <see cref="HttpListenerRequest"/> is an HTTP Upgrade
-    /// request to switch to the specified <paramref name="protocol"/>.
+    /// Determines whether the specified string is a URI string.
     /// </summary>
     /// <returns>
-    /// <c>true</c> if <paramref name="request"/> is an HTTP Upgrade request to switch to
-    /// <paramref name="protocol"/>; otherwise, <c>false</c>.
-    /// </returns>
-    /// <param name="request">
-    /// A <see cref="HttpListenerRequest"/> that represents the HTTP request.
-    /// </param>
-    /// <param name="protocol">
-    /// A <see cref="string"/> that represents the protocol name.
-    /// </param>
-    /// <exception cref="ArgumentNullException">
-    ///   <para>
-    ///   <paramref name="request"/> is <see langword="null"/>.
-    ///   </para>
-    ///   <para>
-    ///   -or-
-    ///   </para>
-    ///   <para>
-    ///   <paramref name="protocol"/> is <see langword="null"/>.
-    ///   </para>
-    /// </exception>
-    /// <exception cref="ArgumentException">
-    /// <paramref name="protocol"/> is empty.
-    /// </exception>
-    public static bool IsUpgradeTo (this HttpListenerRequest request, string protocol)
-    {
-      if (request == null)
-        throw new ArgumentNullException ("request");
-
-      if (protocol == null)
-        throw new ArgumentNullException ("protocol");
-
-      if (protocol.Length == 0)
-        throw new ArgumentException ("An empty string.", "protocol");
-
-      return request.Headers.Contains ("Upgrade", protocol) &&
-             request.Headers.Contains ("Connection", "Upgrade");
-    }
-
-    /// <summary>
-    /// Determines whether the specified <see cref="string"/> is a URI string.
-    /// </summary>
-    /// <returns>
-    /// <c>true</c> if <paramref name="value"/> may be a URI string; otherwise, <c>false</c>.
+    /// <c>true</c> if <paramref name="value"/> may be a URI string;
+    /// otherwise, <c>false</c>.
     /// </returns>
     /// <param name="value">
     /// A <see cref="string"/> to test.
     /// </param>
     public static bool MaybeUri (this string value)
     {
-      if (value == null || value.Length == 0)
+      if (value == null)
         return false;
 
-      var i = value.IndexOf (':');
-      if (i == -1)
+      if (value.Length == 0)
         return false;
 
-      if (i >= 10)
+      var idx = value.IndexOf (':');
+      if (idx == -1)
         return false;
 
-      return value.Substring (0, i).IsPredefinedScheme ();
+      if (idx >= 10)
+        return false;
+
+      var schm = value.Substring (0, idx);
+      return schm.IsPredefinedScheme ();
     }
 
     /// <summary>
-    /// Retrieves a sub-array from the specified <paramref name="array"/>.
-    /// A sub-array starts at the specified element position in <paramref name="array"/>.
+    /// Retrieves a sub-array from the specified array. A sub-array starts at
+    /// the specified index in the array.
     /// </summary>
     /// <returns>
-    /// An array of T that receives a sub-array, or an empty array of T
-    /// if any problems with the parameters.
+    /// An array of T that receives a sub-array.
     /// </returns>
     /// <param name="array">
     /// An array of T from which to retrieve a sub-array.
     /// </param>
     /// <param name="startIndex">
-    /// An <see cref="int"/> that represents the zero-based starting position of
-    /// a sub-array in <paramref name="array"/>.
+    /// An <see cref="int"/> that represents the zero-based index in the array
+    /// at which retrieving starts.
     /// </param>
     /// <param name="length">
     /// An <see cref="int"/> that represents the number of elements to retrieve.
     /// </param>
     /// <typeparam name="T">
-    /// The type of elements in <paramref name="array"/>.
+    /// The type of elements in the array.
     /// </typeparam>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="array"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    ///   <para>
+    ///   <paramref name="startIndex"/> is less than zero.
+    ///   </para>
+    ///   <para>
+    ///   -or-
+    ///   </para>
+    ///   <para>
+    ///   <paramref name="startIndex"/> is greater than the end of the array.
+    ///   </para>
+    ///   <para>
+    ///   -or-
+    ///   </para>
+    ///   <para>
+    ///   <paramref name="length"/> is less than zero.
+    ///   </para>
+    ///   <para>
+    ///   -or-
+    ///   </para>
+    ///   <para>
+    ///   <paramref name="length"/> is greater than the number of elements from
+    ///   <paramref name="startIndex"/> to the end of the array.
+    ///   </para>
+    /// </exception>
     public static T[] SubArray<T> (this T[] array, int startIndex, int length)
     {
-      int len;
-      if (array == null || (len = array.Length) == 0)
+      if (array == null)
+        throw new ArgumentNullException ("array");
+
+      var len = array.Length;
+      if (len == 0) {
+        if (startIndex != 0)
+          throw new ArgumentOutOfRangeException ("startIndex");
+
+        if (length != 0)
+          throw new ArgumentOutOfRangeException ("length");
+
+        return array;
+      }
+
+      if (startIndex < 0 || startIndex >= len)
+        throw new ArgumentOutOfRangeException ("startIndex");
+
+      if (length < 0 || length > len - startIndex)
+        throw new ArgumentOutOfRangeException ("length");
+
+      if (length == 0)
         return new T[0];
 
-      if (startIndex < 0 || length <= 0 || startIndex + length > len)
-        return new T[0];
-
-      if (startIndex == 0 && length == len)
+      if (length == len)
         return array;
 
       var subArray = new T[length];
@@ -1388,36 +1694,78 @@ namespace WebSocketSharp
     }
 
     /// <summary>
-    /// Retrieves a sub-array from the specified <paramref name="array"/>.
-    /// A sub-array starts at the specified element position in <paramref name="array"/>.
+    /// Retrieves a sub-array from the specified array. A sub-array starts at
+    /// the specified index in the array.
     /// </summary>
     /// <returns>
-    /// An array of T that receives a sub-array, or an empty array of T
-    /// if any problems with the parameters.
+    /// An array of T that receives a sub-array.
     /// </returns>
     /// <param name="array">
     /// An array of T from which to retrieve a sub-array.
     /// </param>
     /// <param name="startIndex">
-    /// A <see cref="long"/> that represents the zero-based starting position of
-    /// a sub-array in <paramref name="array"/>.
+    /// A <see cref="long"/> that represents the zero-based index in the array
+    /// at which retrieving starts.
     /// </param>
     /// <param name="length">
     /// A <see cref="long"/> that represents the number of elements to retrieve.
     /// </param>
     /// <typeparam name="T">
-    /// The type of elements in <paramref name="array"/>.
+    /// The type of elements in the array.
     /// </typeparam>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="array"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    ///   <para>
+    ///   <paramref name="startIndex"/> is less than zero.
+    ///   </para>
+    ///   <para>
+    ///   -or-
+    ///   </para>
+    ///   <para>
+    ///   <paramref name="startIndex"/> is greater than the end of the array.
+    ///   </para>
+    ///   <para>
+    ///   -or-
+    ///   </para>
+    ///   <para>
+    ///   <paramref name="length"/> is less than zero.
+    ///   </para>
+    ///   <para>
+    ///   -or-
+    ///   </para>
+    ///   <para>
+    ///   <paramref name="length"/> is greater than the number of elements from
+    ///   <paramref name="startIndex"/> to the end of the array.
+    ///   </para>
+    /// </exception>
     public static T[] SubArray<T> (this T[] array, long startIndex, long length)
     {
-      long len;
-      if (array == null || (len = array.LongLength) == 0)
+      if (array == null)
+        throw new ArgumentNullException ("array");
+
+      var len = array.LongLength;
+      if (len == 0) {
+        if (startIndex != 0)
+          throw new ArgumentOutOfRangeException ("startIndex");
+
+        if (length != 0)
+          throw new ArgumentOutOfRangeException ("length");
+
+        return array;
+      }
+
+      if (startIndex < 0 || startIndex >= len)
+        throw new ArgumentOutOfRangeException ("startIndex");
+
+      if (length < 0 || length > len - startIndex)
+        throw new ArgumentOutOfRangeException ("length");
+
+      if (length == 0)
         return new T[0];
 
-      if (startIndex < 0 || length <= 0 || startIndex + length > len)
-        return new T[0];
-
-      if (startIndex == 0 && length == len)
+      if (length == len)
         return array;
 
       var subArray = new T[length];
@@ -1427,99 +1775,139 @@ namespace WebSocketSharp
     }
 
     /// <summary>
-    /// Executes the specified <see cref="Action"/> delegate <paramref name="n"/> times.
+    /// Executes the specified delegate the specified times.
     /// </summary>
     /// <param name="n">
-    /// An <see cref="int"/> is the number of times to execute.
+    /// An <see cref="int"/> that specifies the number of times to execute.
     /// </param>
     /// <param name="action">
-    /// An <see cref="Action"/> delegate that references the method(s) to execute.
+    /// An <see cref="Action"/> delegate to execute.
     /// </param>
     public static void Times (this int n, Action action)
     {
-      if (n > 0 && action != null)
-        ((ulong) n).times (action);
+      if (n <= 0)
+        return;
+
+      if (action == null)
+        return;
+
+      for (int i = 0; i < n; i++)
+        action ();
     }
 
     /// <summary>
-    /// Executes the specified <see cref="Action"/> delegate <paramref name="n"/> times.
+    /// Executes the specified delegate the specified times.
     /// </summary>
     /// <param name="n">
-    /// A <see cref="long"/> is the number of times to execute.
+    /// A <see cref="long"/> that specifies the number of times to execute.
     /// </param>
     /// <param name="action">
-    /// An <see cref="Action"/> delegate that references the method(s) to execute.
+    /// An <see cref="Action"/> delegate to execute.
     /// </param>
     public static void Times (this long n, Action action)
     {
-      if (n > 0 && action != null)
-        ((ulong) n).times (action);
+      if (n <= 0)
+        return;
+
+      if (action == null)
+        return;
+
+      for (long i = 0; i < n; i++)
+        action ();
     }
 
     /// <summary>
-    /// Executes the specified <see cref="Action"/> delegate <paramref name="n"/> times.
+    /// Executes the specified delegate the specified times.
     /// </summary>
     /// <param name="n">
-    /// A <see cref="uint"/> is the number of times to execute.
+    /// A <see cref="uint"/> that specifies the number of times to execute.
     /// </param>
     /// <param name="action">
-    /// An <see cref="Action"/> delegate that references the method(s) to execute.
+    /// An <see cref="Action"/> delegate to execute.
     /// </param>
     public static void Times (this uint n, Action action)
     {
-      if (n > 0 && action != null)
-        ((ulong) n).times (action);
+      if (n == 0)
+        return;
+
+      if (action == null)
+        return;
+
+      for (uint i = 0; i < n; i++)
+        action ();
     }
 
     /// <summary>
-    /// Executes the specified <see cref="Action"/> delegate <paramref name="n"/> times.
+    /// Executes the specified delegate the specified times.
     /// </summary>
     /// <param name="n">
-    /// A <see cref="ulong"/> is the number of times to execute.
+    /// A <see cref="ulong"/> that specifies the number of times to execute.
     /// </param>
     /// <param name="action">
-    /// An <see cref="Action"/> delegate that references the method(s) to execute.
+    /// An <see cref="Action"/> delegate to execute.
     /// </param>
     public static void Times (this ulong n, Action action)
     {
-      if (n > 0 && action != null)
-        n.times (action);
+      if (n == 0)
+        return;
+
+      if (action == null)
+        return;
+
+      for (ulong i = 0; i < n; i++)
+        action ();
     }
 
     /// <summary>
-    /// Executes the specified <c>Action&lt;int&gt;</c> delegate <paramref name="n"/> times.
+    /// Executes the specified delegate <paramref name="n"/> times.
     /// </summary>
     /// <param name="n">
-    /// An <see cref="int"/> is the number of times to execute.
+    /// An <see cref="int"/> that specifies the number of times to execute.
     /// </param>
     /// <param name="action">
-    /// An <c>Action&lt;int&gt;</c> delegate that references the method(s) to execute.
-    /// An <see cref="int"/> parameter to pass to the method(s) is the zero-based count
-    /// of iteration.
+    ///   <para>
+    ///   An <c>Action&lt;int&gt;</c> delegate to execute.
+    ///   </para>
+    ///   <para>
+    ///   The <see cref="int"/> parameter is the zero-based count of iteration.
+    ///   </para>
     /// </param>
     public static void Times (this int n, Action<int> action)
     {
-      if (n > 0 && action != null)
-        for (int i = 0; i < n; i++)
-          action (i);
+      if (n <= 0)
+        return;
+
+      if (action == null)
+        return;
+
+      for (int i = 0; i < n; i++)
+        action (i);
     }
 
     /// <summary>
-    /// Executes the specified <c>Action&lt;long&gt;</c> delegate <paramref name="n"/> times.
+    /// Executes the specified delegate <paramref name="n"/> times.
     /// </summary>
     /// <param name="n">
-    /// A <see cref="long"/> is the number of times to execute.
+    /// A <see cref="long"/> that specifies the number of times to execute.
     /// </param>
     /// <param name="action">
-    /// An <c>Action&lt;long&gt;</c> delegate that references the method(s) to execute.
-    /// A <see cref="long"/> parameter to pass to the method(s) is the zero-based count
-    /// of iteration.
+    ///   <para>
+    ///   An <c>Action&lt;long&gt;</c> delegate to execute.
+    ///   </para>
+    ///   <para>
+    ///   The <see cref="long"/> parameter is the zero-based count of iteration.
+    ///   </para>
     /// </param>
     public static void Times (this long n, Action<long> action)
     {
-      if (n > 0 && action != null)
-        for (long i = 0; i < n; i++)
-          action (i);
+      if (n <= 0)
+        return;
+
+      if (action == null)
+        return;
+
+      for (long i = 0; i < n; i++)
+        action (i);
     }
 
     /// <summary>
@@ -1530,8 +1918,8 @@ namespace WebSocketSharp
     /// </param>
     /// <param name="action">
     /// An <c>Action&lt;uint&gt;</c> delegate that references the method(s) to execute.
-    /// A <see cref="uint"/> parameter to pass to the method(s) is the zero-based count
-    /// of iteration.
+    /// A <see cref="uint"/> parameter to pass to the method(s) is the zero-based count of
+    /// iteration.
     /// </param>
     public static void Times (this uint n, Action<uint> action)
     {
@@ -1548,8 +1936,8 @@ namespace WebSocketSharp
     /// </param>
     /// <param name="action">
     /// An <c>Action&lt;ulong&gt;</c> delegate that references the method(s) to execute.
-    /// A <see cref="ulong"/> parameter to pass to this method(s) is the zero-based count
-    /// of iteration.
+    /// A <see cref="ulong"/> parameter to pass to this method(s) is the zero-based count of
+    /// iteration.
     /// </param>
     public static void Times (this ulong n, Action<ulong> action)
     {
@@ -1562,9 +1950,9 @@ namespace WebSocketSharp
     /// Converts the specified array of <see cref="byte"/> to the specified type data.
     /// </summary>
     /// <returns>
-    /// A T converted from <paramref name="source"/>, or a default value of T if
-    /// <paramref name="source"/> is an empty array of <see cref="byte"/> or if the
-    /// type of T isn't <see cref="bool"/>, <see cref="char"/>, <see cref="double"/>,
+    /// A T converted from <paramref name="source"/>, or a default value of
+    /// T if <paramref name="source"/> is an empty array of <see cref="byte"/> or
+    /// if the type of T isn't <see cref="bool"/>, <see cref="char"/>, <see cref="double"/>,
     /// <see cref="float"/>, <see cref="int"/>, <see cref="long"/>, <see cref="short"/>,
     /// <see cref="uint"/>, <see cref="ulong"/>, or <see cref="ushort"/>.
     /// </returns>
@@ -1572,7 +1960,7 @@ namespace WebSocketSharp
     /// An array of <see cref="byte"/> to convert.
     /// </param>
     /// <param name="sourceOrder">
-    /// One of the <see cref="ByteOrder"/> enum values, indicates the byte order of
+    /// One of the <see cref="ByteOrder"/> enum values, specifies the byte order of
     /// <paramref name="source"/>.
     /// </param>
     /// <typeparam name="T">
@@ -1626,7 +2014,7 @@ namespace WebSocketSharp
     /// A T to convert.
     /// </param>
     /// <param name="order">
-    /// One of the <see cref="ByteOrder"/> enum values, indicates the byte order of the return.
+    /// One of the <see cref="ByteOrder"/> enum values, specifies the byte order of the return.
     /// </param>
     /// <typeparam name="T">
     /// The type of <paramref name="value"/>. The T must be a value type.
@@ -1657,7 +2045,7 @@ namespace WebSocketSharp
                                     ? BitConverter.GetBytes ((UInt32)(object) value)
                                     : type == typeof (UInt64)
                                       ? BitConverter.GetBytes ((UInt64)(object) value)
-                                      : new byte[0];
+                                      : WebSocket.EmptyBytes;
 
       if (bytes.Length > 1 && !order.IsHostOrder ())
         Array.Reverse (bytes);
@@ -1666,17 +2054,30 @@ namespace WebSocketSharp
     }
 
     /// <summary>
-    /// Converts the order of the specified array of <see cref="byte"/> to the host byte order.
+    /// Converts the order of elements in the specified byte array to
+    /// host (this computer architecture) byte order.
     /// </summary>
     /// <returns>
-    /// An array of <see cref="byte"/> converted from <paramref name="source"/>.
+    ///   <para>
+    ///   An array of <see cref="byte"/> converted from
+    ///   <paramref name="source"/>.
+    ///   </para>
+    ///   <para>
+    ///   Or <paramref name="source"/> if the number of elements in it
+    ///   is less than 2 or <paramref name="sourceOrder"/> is same as
+    ///   host byte order.
+    ///   </para>
     /// </returns>
     /// <param name="source">
     /// An array of <see cref="byte"/> to convert.
     /// </param>
     /// <param name="sourceOrder">
-    /// One of the <see cref="ByteOrder"/> enum values, indicates the byte order of
-    /// <paramref name="source"/>.
+    ///   <para>
+    ///   One of the <see cref="ByteOrder"/> enum values.
+    ///   </para>
+    ///   <para>
+    ///   It specifies the order of elements in <paramref name="source"/>.
+    ///   </para>
     /// </param>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="source"/> is <see langword="null"/>.
@@ -1686,25 +2087,30 @@ namespace WebSocketSharp
       if (source == null)
         throw new ArgumentNullException ("source");
 
-      return source.Length > 1 && !sourceOrder.IsHostOrder ()
-             ? source.Reverse ()
-             : source;
+      if (source.Length < 2)
+        return source;
+
+      return !sourceOrder.IsHostOrder () ? source.Reverse () : source;
     }
 
     /// <summary>
-    /// Converts the specified <paramref name="array"/> to a <see cref="string"/>
-    /// that concatenates the each element of <paramref name="array"/> across the
-    /// specified <paramref name="separator"/>.
+    /// Converts the specified array to a <see cref="string"/>.
     /// </summary>
     /// <returns>
-    /// A <see cref="string"/> converted from <paramref name="array"/>,
-    /// or <see cref="String.Empty"/> if <paramref name="array"/> is empty.
+    ///   <para>
+    ///   A <see cref="string"/> converted by concatenating each element of
+    ///   <paramref name="array"/> across <paramref name="separator"/>.
+    ///   </para>
+    ///   <para>
+    ///   An empty string if <paramref name="array"/> is an empty array.
+    ///   </para>
     /// </returns>
     /// <param name="array">
     /// An array of T to convert.
     /// </param>
     /// <param name="separator">
-    /// A <see cref="string"/> that represents the separator string.
+    /// A <see cref="string"/> used to separate each element of
+    /// <paramref name="array"/>.
     /// </param>
     /// <typeparam name="T">
     /// The type of elements in <paramref name="array"/>.
@@ -1725,91 +2131,81 @@ namespace WebSocketSharp
         separator = String.Empty;
 
       var buff = new StringBuilder (64);
-      (len - 1).Times (i => buff.AppendFormat ("{0}{1}", array[i].ToString (), separator));
+
+      for (var i = 0; i < len - 1; i++)
+        buff.AppendFormat ("{0}{1}", array[i], separator);
 
       buff.Append (array[len - 1].ToString ());
       return buff.ToString ();
     }
 
     /// <summary>
-    /// Converts the specified <see cref="string"/> to a <see cref="Uri"/>.
+    /// Converts the specified string to a <see cref="Uri"/>.
     /// </summary>
     /// <returns>
-    /// A <see cref="Uri"/> converted from <paramref name="uriString"/>, or <see langword="null"/>
-    /// if <paramref name="uriString"/> isn't successfully converted.
+    ///   <para>
+    ///   A <see cref="Uri"/> converted from <paramref name="value"/>.
+    ///   </para>
+    ///   <para>
+    ///   <see langword="null"/> if the conversion has failed.
+    ///   </para>
     /// </returns>
-    /// <param name="uriString">
+    /// <param name="value">
     /// A <see cref="string"/> to convert.
     /// </param>
-    public static Uri ToUri (this string uriString)
+    public static Uri ToUri (this string value)
     {
-      Uri res;
-      return Uri.TryCreate (
-               uriString, uriString.MaybeUri () ? UriKind.Absolute : UriKind.Relative, out res)
-             ? res
-             : null;
+      Uri ret;
+      Uri.TryCreate (
+        value, value.MaybeUri () ? UriKind.Absolute : UriKind.Relative, out ret
+      );
+
+      return ret;
     }
 
     /// <summary>
-    /// URL-decodes the specified <see cref="string"/>.
-    /// </summary>
-    /// <returns>
-    /// A <see cref="string"/> that receives the decoded string, or the <paramref name="value"/>
-    /// if it's <see langword="null"/> or empty.
-    /// </returns>
-    /// <param name="value">
-    /// A <see cref="string"/> to decode.
-    /// </param>
-    public static string UrlDecode (this string value)
-    {
-      return value != null && value.Length > 0
-             ? HttpUtility.UrlDecode (value)
-             : value;
-    }
-
-    /// <summary>
-    /// URL-encodes the specified <see cref="string"/>.
-    /// </summary>
-    /// <returns>
-    /// A <see cref="string"/> that receives the encoded string, or <paramref name="value"/>
-    /// if it's <see langword="null"/> or empty.
-    /// </returns>
-    /// <param name="value">
-    /// A <see cref="string"/> to encode.
-    /// </param>
-    public static string UrlEncode (this string value)
-    {
-      return value != null && value.Length > 0
-             ? HttpUtility.UrlEncode (value)
-             : value;
-    }
-
-    /// <summary>
-    /// Writes the specified <paramref name="content"/> data with the specified
+    /// Writes and sends the specified <paramref name="content"/> data with the specified
     /// <see cref="HttpListenerResponse"/>.
     /// </summary>
     /// <param name="response">
-    /// A <see cref="HttpListenerResponse"/> that represents the HTTP response
-    /// used to write the content data.
+    /// A <see cref="HttpListenerResponse"/> that represents the HTTP response used to
+    /// send the content data.
     /// </param>
     /// <param name="content">
-    /// An array of <see cref="byte"/> that represents the content data to write.
+    /// An array of <see cref="byte"/> that represents the content data to send.
     /// </param>
     /// <exception cref="ArgumentNullException">
-    /// <paramref name="response"/> is <see langword="null"/>.
+    ///   <para>
+    ///   <paramref name="response"/> is <see langword="null"/>.
+    ///   </para>
+    ///   <para>
+    ///   -or-
+    ///   </para>
+    ///   <para>
+    ///   <paramref name="content"/> is <see langword="null"/>.
+    ///   </para>
     /// </exception>
     public static void WriteContent (this HttpListenerResponse response, byte[] content)
     {
       if (response == null)
         throw new ArgumentNullException ("response");
 
-      var len = 0;
-      if (content == null || (len = content.Length) == 0)
-        return;
+      if (content == null)
+        throw new ArgumentNullException ("content");
 
-      var output = response.OutputStream;
+      var len = content.LongLength;
+      if (len == 0) {
+        response.Close ();
+        return;
+      }
+
       response.ContentLength64 = len;
-      output.Write (content, 0, len);
+      var output = response.OutputStream;
+      if (len <= Int32.MaxValue)
+        output.Write (content, 0, (int) len);
+      else
+        output.WriteBytes (content, 1024);
+
       output.Close ();
     }
 

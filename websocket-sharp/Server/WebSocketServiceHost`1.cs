@@ -1,14 +1,10 @@
 #region License
 /*
- * HttpBasicIdentity.cs
- *
- * This code is derived from HttpListenerBasicIdentity.cs (System.Net) of
- * Mono (http://www.mono-project.com).
+ * WebSocketServiceHost`1.cs
  *
  * The MIT License
  *
- * Copyright (c) 2005 Novell, Inc. (http://www.novell.com)
- * Copyright (c) 2014-2017 sta.blockhead
+ * Copyright (c) 2015-2017 sta.blockhead
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -30,51 +26,75 @@
  */
 #endregion
 
-#region Authors
-/*
- * Authors:
- * - Gonzalo Paniagua Javier <gonzalo@novell.com>
- */
-#endregion
-
 using System;
-using System.Security.Principal;
 
-namespace WebSocketSharp.Net
+namespace WebSocketSharp.Server
 {
-  /// <summary>
-  /// Holds the username and password from an HTTP Basic authentication attempt.
-  /// </summary>
-  public class HttpBasicIdentity : GenericIdentity
+  internal class WebSocketServiceHost<TBehavior> : WebSocketServiceHost
+    where TBehavior : WebSocketBehavior
   {
     #region Private Fields
 
-    private string _password;
+    private Func<TBehavior> _creator;
 
     #endregion
 
     #region Internal Constructors
 
-    internal HttpBasicIdentity (string username, string password)
-      : base (username, "Basic")
+    internal WebSocketServiceHost (
+      string path, Func<TBehavior> creator, Logger log
+    )
+      : this (path, creator, null, log)
     {
-      _password = password;
+    }
+
+    internal WebSocketServiceHost (
+      string path,
+      Func<TBehavior> creator,
+      Action<TBehavior> initializer,
+      Logger log
+    )
+      : base (path, log)
+    {
+      _creator = createCreator (creator, initializer);
     }
 
     #endregion
 
     #region Public Properties
 
-    /// <summary>
-    /// Gets the password from a basic authentication attempt.
-    /// </summary>
-    /// <value>
-    /// A <see cref="string"/> that represents the password.
-    /// </value>
-    public virtual string Password {
+    public override Type BehaviorType {
       get {
-        return _password;
+        return typeof (TBehavior);
       }
+    }
+
+    #endregion
+
+    #region Private Methods
+
+    private Func<TBehavior> createCreator (
+      Func<TBehavior> creator, Action<TBehavior> initializer
+    )
+    {
+      if (initializer == null)
+        return creator;
+
+      return () => {
+               var ret = creator ();
+               initializer (ret);
+
+               return ret;
+             };
+    }
+
+    #endregion
+
+    #region Protected Methods
+
+    protected override WebSocketBehavior CreateSession ()
+    {
+      return _creator ();
     }
 
     #endregion

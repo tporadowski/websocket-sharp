@@ -4,7 +4,7 @@
  *
  * The MIT License
  *
- * Copyright (c) 2012-2014 sta.blockhead
+ * Copyright (c) 2012-2019 sta.blockhead
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -29,7 +29,6 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
-using System.Text;
 
 namespace WebSocketSharp
 {
@@ -40,38 +39,74 @@ namespace WebSocketSharp
     private byte[] _data;
     private long   _extDataLength;
     private long   _length;
-    private bool   _masked;
 
     #endregion
 
     #region Public Fields
 
-    public const ulong MaxLength = Int64.MaxValue;
+    /// <summary>
+    /// Represents the empty payload data.
+    /// </summary>
+    public static readonly PayloadData Empty;
+
+    /// <summary>
+    /// Represents the allowable max length of payload data.
+    /// </summary>
+    /// <remarks>
+    ///   <para>
+    ///   A <see cref="WebSocketException"/> will occur when the length of
+    ///   incoming payload data is greater than the value of this field.
+    ///   </para>
+    ///   <para>
+    ///   If you would like to change the value of this field, it must be
+    ///   a number between <see cref="WebSocket.FragmentLength"/> and
+    ///   <see cref="Int64.MaxValue"/> inclusive.
+    ///   </para>
+    /// </remarks>
+    public static readonly ulong MaxLength;
+
+    #endregion
+
+    #region Static Constructor
+
+    static PayloadData ()
+    {
+      Empty = new PayloadData (WebSocket.EmptyBytes, 0);
+      MaxLength = Int64.MaxValue;
+    }
 
     #endregion
 
     #region Internal Constructors
 
-    internal PayloadData ()
-    {
-      _data = new byte[0];
-    }
-
     internal PayloadData (byte[] data)
-      : this (data, false)
+      : this (data, data.LongLength)
     {
     }
 
-    internal PayloadData (byte[] data, bool masked)
+    internal PayloadData (byte[] data, long length)
     {
       _data = data;
-      _masked = masked;
-      _length = data.LongLength;
+      _length = length;
+    }
+
+    internal PayloadData (ushort code, string reason)
+    {
+      _data = code.Append (reason);
+      _length = _data.LongLength;
     }
 
     #endregion
 
     #region Internal Properties
+
+    internal ushort Code {
+      get {
+        return _length >= 2
+               ? _data.SubArray (0, 2).ToUInt16 (ByteOrder.Big)
+               : (ushort) 1005;
+      }
+    }
 
     internal long ExtensionDataLength {
       get {
@@ -83,9 +118,23 @@ namespace WebSocketSharp
       }
     }
 
-    internal bool IncludesReservedCloseStatusCode {
+    internal bool HasReservedCode {
       get {
-        return _length > 1 && _data.SubArray (0, 2).ToUInt16 (ByteOrder.Big).IsReserved ();
+        return _length >= 2 && Code.IsReserved ();
+      }
+    }
+
+    internal string Reason {
+      get {
+        if (_length <= 2)
+          return String.Empty;
+
+        var raw = _data.SubArray (2, _length - 2);
+
+        string reason;
+        return raw.TryGetUTF8DecodedString (out reason)
+               ? reason
+               : String.Empty;
       }
     }
 
@@ -105,13 +154,7 @@ namespace WebSocketSharp
       get {
         return _extDataLength > 0
                ? _data.SubArray (0, _extDataLength)
-               : new byte[0];
-      }
-    }
-
-    public bool IsMasked {
-      get {
-        return _masked;
+               : WebSocket.EmptyBytes;
       }
     }
 
@@ -129,8 +172,6 @@ namespace WebSocketSharp
     {
       for (long i = 0; i < _length; i++)
         _data[i] = (byte) (_data[i] ^ key[i % 4]);
-
-      _masked = !_masked;
     }
 
     #endregion
@@ -143,7 +184,7 @@ namespace WebSocketSharp
         yield return b;
     }
 
-    public byte[] ToByteArray ()
+    public byte[] ToArray ()
     {
       return _data;
     }
